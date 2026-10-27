@@ -6,7 +6,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
-const { CookieJar } = require('tough-cookie');
+const { CookieJar, Cookie } = require('tough-cookie');
 const { URLSearchParams, URL } = require('url');
 const fs = require('fs').promises;
 const path = require('path');
@@ -318,7 +318,7 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality) {
             const $ = cheerio.load(data);
             const finalLinks = [];
 
-            $('.entry-content a[href*="driveseed.org"], .entry-content a[href*="tech.unblockedgames.world"], .entry-content a[href*="tech.creativeexpressionsblog.com"], .entry-content a[href*="tech.examzculture.in"]').each((i, el) => {
+            $('.entry-content a[href*="driveseed.org"], .entry-content a[href*="tech.unblockedgames.world"], .entry-content a[href*="tech.creativeexpressionsblog.com"], .entry-content a[href*="tech.examzculture.in"], .entry-content a[href*="en.thenaukriadda.in"]').each((i, el) => {
                 const link = $(el).attr('href');
                 const text = $(el).text().trim();
                 if (link && text && !text.toLowerCase().includes('batch')) {
@@ -372,83 +372,105 @@ async function resolveIntermediateLink(initialUrl, refererUrl, quality) {
 // Function to resolve tech.unblockedgames.world links to driveleech URLs (adapted from UHDMovies)
 async function resolveTechUnblockedLink(sidUrl) {
     console.log(`[MoviesMod] Resolving SID link: ${sidUrl}`);
-    const { origin } = new URL(sidUrl);
     const jar = new CookieJar();
 
     // Create session
     const session = await createSession(jar);
 
+    // Bounded hop handling: cap LP form submissions to avoid runaway loops.
+    const MAX_LP_HOPS = 4;
+    let lpHopCount = 0;
+    const checkHopLimit = () => {
+        lpHopCount += 1;
+        if (lpHopCount > MAX_LP_HOPS) {
+            throw new Error(`[MoviesMod] LP hop limit exceeded (${MAX_LP_HOPS}).`);
+        }
+    };
+
     try {
-        // Step 0: Get the _wp_http value
+        // Step 0: Get the initial page and find #lp-land form
         console.log("  [SID] Step 0: Fetching initial page...");
         const responseStep0 = await session.get(sidUrl);
         let $ = cheerio.load(responseStep0.data);
-        const initialForm = $('#landing');
-        const wp_http_step1 = initialForm.find('input[name="_wp_http"]').val();
+        const initialForm = $('#lp-land');
         const action_url_step1 = initialForm.attr('action');
 
-        if (!wp_http_step1 || !action_url_step1) {
-            console.error("  [SID] Error: Could not find _wp_http in initial form.");
+        const initialData = {};
+        initialForm.find('input, select, textarea').each((i, el) => {
+            const field = $(el);
+            const name = field.attr('name');
+            const type = field.attr('type');
+            if (name && (!type || type === 'text' || type === 'hidden' || type === 'password')) {
+                const val = field.val();
+                if (val) initialData[name] = val;
+            }
+        });
+
+        if (!action_url_step1) {
+            console.error("  [SID] Error: Could not find #lp-land form.");
             return null;
         }
 
-        // Step 1: POST to the first form's action URL
-        console.log("  [SID] Step 1: Submitting initial form...");
-        const step1Data = new URLSearchParams({ '_wp_http': wp_http_step1 });
-        const responseStep1 = await session.post(action_url_step1, step1Data, {
+        checkHopLimit();
+
+        // Step 1: Submit #lp-land form
+        console.log("  [SID] Step 1: Submitting #lp-land form...");
+        const responseStep1 = await session.post(action_url_step1, new URLSearchParams(initialData), {
             headers: { 'Referer': sidUrl, 'Content-Type': 'application/x-www-form-urlencoded' }
         });
 
-        // Step 2: Parse verification page for second form
-        console.log("  [SID] Step 2: Parsing verification page...");
+        // Step 2: Parse response for #lp-s1-form, wait 11s, submit
+        console.log("  [SID] Step 2: Parsing #lp-s1-form...");
         $ = cheerio.load(responseStep1.data);
-        const verificationForm = $('#landing');
-        const action_url_step2 = verificationForm.attr('action');
-        const wp_http2 = verificationForm.find('input[name="_wp_http2"]').val();
-        const token = verificationForm.find('input[name="token"]').val();
+        const secondForm = $('#lp-s1-form');
+        const action_url_step2 = secondForm.attr('action');
+        const secondFormData = {};
+        secondForm.find('input').each((i, el) => {
+            const field = $(el);
+            const name = field.attr('name');
+            const val = field.val();
+            if (name && val) secondFormData[name] = val;
+        });
 
         if (!action_url_step2) {
-            console.error("  [SID] Error: Could not find verification form.");
+            console.error("  [SID] Error: Could not find #lp-s1-form.");
             return null;
         }
 
-        // Step 3: POST to the verification URL
-        console.log("  [SID] Step 3: Submitting verification...");
-        const step2Data = new URLSearchParams({ '_wp_http2': wp_http2, 'token': token });
-        const responseStep2 = await session.post(action_url_step2, step2Data, {
+        console.log("  [SID] Step 3: Waiting 11 seconds before submitting #lp-s1-form...");
+        await new Promise(resolve => setTimeout(resolve, 11000));
+
+        checkHopLimit();
+
+        console.log("  [SID] Step 4: Submitting #lp-s1-form...");
+        const responseStep2 = await session.post(action_url_step2, new URLSearchParams(secondFormData), {
             headers: { 'Referer': responseStep1.request.res.responseUrl, 'Content-Type': 'application/x-www-form-urlencoded' }
         });
 
-        // Step 4: Find dynamic cookie and link from JavaScript
-        console.log("  [SID] Step 4: Parsing final page for JS data...");
-        let finalLinkPath = null;
-        let cookieName = null;
-        let cookieValue = null;
+        // Step 5: Parse generate page for continue-driven destination
+        console.log("  [SID] Step 5: Parsing generate page for continue destination...");
+        $ = cheerio.load(responseStep2.data);
+        // Respect the displayed countdown before looking for the continue destination.
+        await new Promise(resolve => setTimeout(resolve, 6000));
 
-        const scriptContent = responseStep2.data;
-        const cookieMatch = scriptContent.match(/s_343\('([^']+)',\s*'([^']+)'/);
-        const linkMatch = scriptContent.match(/c\.setAttribute\("href",\s*"([^"]+)"\)/);
-
-        if (cookieMatch) {
-            cookieName = cookieMatch[1].trim();
-            cookieValue = cookieMatch[2].trim();
-        }
-        if (linkMatch) {
-            finalLinkPath = linkMatch[1].trim();
+        const setAttrMatch = responseStep2.data.match(/bg\.setAttribute\('href',\s*"([^"]+)"\)/);
+        let finalUrl = null;
+        if (setAttrMatch && setAttrMatch[1]) {
+            finalUrl = setAttrMatch[1].replace(/\\\//g, '/');
         }
 
-        if (!finalLinkPath || !cookieName || !cookieValue) {
-            console.error("  [SID] Error: Could not extract dynamic cookie/link from JS.");
+        if (!finalUrl) {
+            console.error("  [SID] Error: Could not find continue-driven destination in generate page.");
             return null;
         }
 
-        const finalUrl = new URL(finalLinkPath, origin).href;
-        console.log(`  [SID] Dynamic link found: ${finalUrl}`);
-        console.log(`  [SID] Dynamic cookie found: ${cookieName}`);
-
-        // Step 5: Set cookie and make final request
-        console.log("  [SID] Step 5: Setting cookie and making final request...");
-        await jar.setCookie(`${cookieName}=${cookieValue}`, origin);
+        // Mirror the continue handler: set the LP session cookie before following the destination.
+        const scMatch = responseStep2.data.match(/sc\("([^"]+)","([^"]+)"/);
+        if (scMatch) {
+            const lpCookie = new Cookie(scMatch[1], scMatch[2], { path: '/' });
+            lpCookie.expires = new Date(Date.now() + 60 * 60 * 1000);
+            await jar.setCookie(lpCookie, new URL(finalUrl).origin);
+        }
 
         const finalResponse = await session.get(finalUrl, {
             headers: { 'Referer': responseStep2.request.res.responseUrl }
@@ -462,7 +484,7 @@ async function resolveTechUnblockedLink(sidUrl) {
             const urlMatch = content.match(/url=(.*)/i);
             if (urlMatch && urlMatch[1]) {
                 const driveleechUrl = urlMatch[1].replace(/"/g, "").replace(/'/g, "");
-                console.log(`  [SID] SUCCESS! Resolved Driveleech URL: ${driveleechUrl}`);
+                console.log(`  [SID] SUCCESS! Resolved Driveleech URL.`);
                 return driveleechUrl;
             }
         }
@@ -859,7 +881,7 @@ async function getMoviesModStreams(tmdbId, mediaType, seasonNum = null, episodeN
                                 let currentUrl = targetLink.url;
 
                                 // Handle SID links if they appear
-                                if (currentUrl.includes('tech.unblockedgames.world') || currentUrl.includes('tech.creativeexpressionsblog.com') || currentUrl.includes('tech.examzculture.in')) {
+                                if (currentUrl.includes('tech.unblockedgames.world') || currentUrl.includes('tech.creativeexpressionsblog.com') || currentUrl.includes('tech.examzculture.in') || new URL(currentUrl).hostname === 'en.thenaukriadda.in') {
                                     const resolvedUrl = await resolveTechUnblockedLink(currentUrl);
                                     if (!resolvedUrl) return null;
                                     currentUrl = resolvedUrl;

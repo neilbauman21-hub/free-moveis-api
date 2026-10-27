@@ -19,6 +19,8 @@
 
 const axios = require('axios');
 
+const { httpAgent, httpsAgent } = require('../utils/dnsFallback');
+
 const API_BASE = 'https://core.vidzee.wtf';
 const EMBED_ORIGIN = 'https://player.vidzee.wtf';
 // Header the CDNs expect on the real stream requests. It must be the *player*
@@ -71,6 +73,8 @@ async function fetchStreams(opts) {
       Origin: EMBED_ORIGIN,
     },
     timeout: 12000,
+    httpAgent,
+    httpsAgent,
   });
   return resp.data;
 }

@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Node.js-18%2B-brightgreen?style=flat" />
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat" />
-  <img src="https://img.shields.io/badge/Version-1.0.11-informational?style=flat" />
+  <img src="https://img.shields.io/badge/Version-1.0.16-informational?style=flat" />
   <img src="https://img.shields.io/badge/ffmpeg-required-orange?style=flat" />
 </p>
 
@@ -70,6 +70,13 @@ npm run start:mp4          # or: node vidzee-mp4.js
 |-------|---------|
 | `?download=1` | send `Content-Disposition: attachment` — saves instead of playing in-browser |
 | `?sr=<name>` | force a specific VidZee server instead of auto-selecting |
+| `?interpolation=gpu` | GPU frame interpolation (VapourSynth + RIFE; downloads the whole title first) |
+| `?interpolation=cpu` | CPU frame interpolation (ffmpeg `minterpolate`; no GPU, usually slower than realtime) |
+| `?fps=<n>` | interpolation target rate, 1–240 (default `40`); only used with `?interpolation=` |
+| `?workers=<n>` | CPU only: parallel `minterpolate` processes, 1–32 (default: all but one core, cap 8; `1` = live single process) |
+| `?rife=1` | legacy alias for `?interpolation=gpu` |
+| `?preview=<seconds>` | stop after N seconds (max 600) — quick A/B checks without waiting for a full download |
+| `?norm=0` | disable EBU R128 loudness normalization (on by default; targets `-16 LUFS`/`-1.5 dBTP`) |
 
 ### Examples
 
@@ -85,9 +92,63 @@ mpv http://localhost:6150/tv/1396/1/1
 
 # Force a particular source
 curl -o out.mp4 "http://localhost:6150/movie/550?sr=dcloud"
+
+# A/B 60 seconds of normal vs interpolated playback in VLC
+vlc "http://localhost:6150/tv/114547/1/2?sr=tik&preview=60"
+vlc "http://localhost:6150/tv/114547/1/2?sr=tik&interpolation=gpu&fps=60&preview=60"
+
+# Opt out of loudness normalization (keep the source's original level)
+curl -o out.mp4 "http://localhost:6150/tv/1396/1/1?sr=tik&norm=0"
 ```
 
 Or just open `http://localhost:6150/movie/550` in a browser and it plays inline.
+
+### Audio levels
+
+Audio is normalized by default to a consistent `-16 LUFS` / `-1.5 dBTP`, because source
+levels vary a lot between titles and servers: measured from this API, Breaking Bad S01E01
+arrived at `-28.9 LUFS` from `tik` but `-22.0 LUFS` from `dcloud`, while Fight Club was
+`-15.6 LUFS`. `?norm=0` opts out per request; set `AUDIO_NORMALIZE=0` to turn it off for
+every request. Normalization is single-pass EBU R128 (`loudnorm`, `-16 LUFS`, `-1.5 dBTP`),
+because a second pass is not possible on a live HLS stream. It re-encodes audio (already the
+case) and does not touch video.
+
+### Frame interpolation
+
+Interpolation is opt-in and selected by URL, so normal playback stays a cheap `-c copy`
+remux. Pick a mode and (optionally) a target rate:
+
+```bash
+# GPU: VapourSynth + RIFE, 60 fps (downloads the title first, then interpolates)
+vlc "http://localhost:6150/tv/114547/1/2?sr=tik&interpolation=gpu&fps=60&preview=60"
+
+# CPU: ffmpeg minterpolate, 60 fps, no GPU required (very CPU-heavy)
+vlc "http://localhost:6150/tv/114547/1/2?sr=tik&interpolation=cpu&fps=60&preview=60"
+
+# CPU across 6 parallel workers (default is all but one core, capped at 8)
+vlc "http://localhost:6150/tv/114547/1/2?sr=tik&interpolation=cpu&workers=6&fps=60"
+
+# Turn interpolation off explicitly (this is the default)
+vlc "http://localhost:6150/movie/550?interpolation=off"
+```
+
+- `gpu` needs a Vulkan-capable GPU and enough tmpfs for the downloaded title. It
+  produces the best quality and is much faster than CPU mode. RIFE is the
+  implementation; `?interpolation=rife` and `?rife=1` remain aliases for `gpu`.
+- `cpu` uses `minterpolate` (`mi_mode=mci`, bidirectional motion estimation) and
+  re-encodes with `libopenh264`. `minterpolate` is effectively single-threaded,
+  so by default the episode is downloaded once and split into time chunks that
+  run in parallel; the chunks are concatenated in order and audio is taken from
+  the complete source, so there are no seams at chunk boundaries. `?workers=1`
+  restores the old live single-process stream (no download, starts immediately).
+  CPU mode is normally slower than realtime, so use `?preview=` while testing.
+  Override the filter with `CPU_INTERPOLATION_FILTER` if you prefer a cheaper mode.
+- `?fps=` accepts whole or fractional rates (for example `59.94`). The target must
+  be higher than the source frame rate to add frames; lower targets drop frames.
+- One interpolation job runs at a time across both modes; normal playback is
+  unaffected. An unknown `?interpolation=` value or invalid `?fps=`/`?workers=`
+  returns `400` instead of silently playing the normal stream. The old
+  `?rife=1` still maps to `interpolation=gpu`.
 
 ### How a source gets picked
 
@@ -95,11 +156,28 @@ Or just open `http://localhost:6150/movie/550` in a browser and it plays inline.
    Hindi dub last so English wins when it's available. `?sr=` skips straight to one.
 2. For each candidate, **probe that it's actually playable**: fetch the playlist, follow a
    master playlist to its first media segment, and sniff the magic bytes. This is not
-   paranoia — the `ipcloud` server wraps its MPEG-TS segments in a 70-byte 1×1 PNG header,
-   which ffmpeg decodes as a still image before aborting with *"Output file does not
-   contain any stream"*. Image-wrapped sources are skipped.
+   paranoia — the `ipcloud` and `tik` servers wrap their MPEG-TS segments in a 70-byte
+   1×1 PNG header, which ffmpeg decodes as a still image before aborting with *"Output file
+   does not contain any stream"*. A real image is still rejected; an image *wrapper* around
+   MPEG-TS is kept, because the relay strips the prefix on the way to ffmpeg.
 3. Use the first English source that passes; otherwise fall back to the first playable
    source in any language.
+
+### How ffmpeg reaches the CDN
+
+Both servers talk to the CDN through a small loopback relay (`utils/hlsRelay.js`) instead
+of handing ffmpeg the upstream URL directly. The relay exists for two reasons ffmpeg can't
+handle itself:
+
+- **DNS.** Some LAN resolvers (router blocklists, AdGuard Home, Pi-hole, NextDNS…) answer
+  `NXDOMAIN` for TikTok CDN hosts such as `p16-sg.tiktokcdn.com` even though they resolve
+  publicly. The relay uses `utils/dnsFallback.js`: system resolver first, then DNS-over-HTTPS
+  (Google/Cloudflare) if that fails, with TTL caching. Set `DNS_FALLBACK_DISABLED=1` to
+  disable the fallback.
+- **Image-wrapped segments.** `ipcloud` and `tik` prepend a 1×1 PNG to every TS segment;
+  the relay removes it and serves clean `video/mp2t`.
+
+Relay URLs carry a per-process token and are only ever handed to a local ffmpeg process.
 
 Servers come and go per title — a dead one answers `502`, and it's normal for only one or
 two of the four to work for any given film.
@@ -126,6 +204,17 @@ two of the four to work for any given film.
 |----------|---------|---------|
 | `MP4_PORT` | `6150` | listen port |
 | `MP4_HOST` | `0.0.0.0` | bind address |
+| `DNS_FALLBACK_DISABLED` | unset | set to `1` to bypass the DoH fallback and use the system resolver only |
+| `AUDIO_NORMALIZE` | `1` | set to `0` to disable loudness normalization by default (same as `?norm=0`) |
+| `AUDIO_NORM_FILTER` | `loudnorm=I=-16:TP=-1.5:LRA=11` | ffmpeg audio filter used when normalization is enabled |
+| `INTERPOLATION_FPS` | `40` | default target rate for `?interpolation=` (legacy alias: `RIFE_FPS`) |
+| `RIFE_DISABLED` | unset | set to `1` to disable the GPU/RIFE mode |
+| `CPU_INTERPOLATION_DISABLED` | unset | set to `1` to disable the CPU interpolation mode |
+| `CPU_INTERPOLATION_FILTER` | `minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=1` | ffmpeg video filter for CPU mode; `{fps}` is replaced with the requested rate |
+| `CPU_MIN_CHUNK_SECONDS` | `5` | shortest CPU chunk; fewer workers are used for short titles |
+| `CPU_INTERPOLATION_DIR` | `$TMPDIR/vidzee-cpu` | working directory for downloaded source and chunk files |
+| `CPU_MAX_BYTES` | `RIFE_MAX_BYTES` | refuse CPU sources larger than this before chunking |
+| `RIFE_VBITRATE` | `6M` | video bitrate for interpolated output |
 
 ---
 
@@ -383,10 +472,11 @@ npm test      # node --test
 npm run lint  # eslint
 ```
 
-25 tests, no network required. They cover VidZee URL construction and response
+44 tests, no network required. They cover VidZee URL construction and response
 normalisation, the provider catalog's integrity (every catalogued export exists; helpers
-aren't providers), config normalisation, and the playability heuristics that keep
-PNG-wrapped sources away from ffmpeg.
+aren't providers), config normalisation, HLS playlist rewriting for the relay/proxy,
+image-wrapper detection, interpolation mode/FPS/worker parsing and chunk planning, and the playability heuristics that
+keep PNG-wrapped sources away from ffmpeg.
 
 ---
 
@@ -401,6 +491,9 @@ PNG-wrapped sources away from ffmpeg.
 | Streams give `403` when fetched | you dropped the `headers` from the stream object — `Referer` is required |
 | `/api/config` returns `401` | log in first; it's session-gated |
 | Everything 404s from VidZee | they rotated again — see [How the VidZee provider works](#-how-the-vidzee-provider-works) |
+| `getaddrinfo ENOTFOUND p16-sg.tiktokcdn.com` / `tik` is skipped | the local resolver is blocking `*.tiktokcdn.com` (common with ad-blocking DNS). The MP4 API retries via DoH, so upgrade and restart; if you set `DNS_FALLBACK_DISABLED=1`, allowlist `*.tiktokcdn.com` in your resolver or turn the fallback back on. For the aggregator, enable `enableProxy` so clients fetch through the proxy. |
+| Interpolation looks identical / VLC shows the source fps | two causes. (1) The parameter is `&interpolation=gpu` or `&interpolation=cpu`; `&?interpolation=...` creates a parameter literally named `?interpolation` and silently plays normal mode. Check the log for `INTERPOLATION=gpu`/`INTERPOLATION=cpu` and `FPS=...`. (2) GPU/RIFE and multi-worker CPU mode download the whole title before the first frame, so until playback starts VLC may still show the previous item's rate. Use `&preview=60` to start in seconds. The H.264 stream carries VUI timing, so VLC's Codec Information reports the target rate. |
+| CPU interpolation only uses one core | `?interpolation=cpu` uses one worker per chunk by default (all but one core, capped at 8); `?workers=1` deliberately restores the single live process. Check the log for `WORKERS=` and how many `chunk(s)` were planned. |
 
 ---
 

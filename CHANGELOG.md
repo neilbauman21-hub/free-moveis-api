@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`?interpolation=gpu|cpu`** replaces the RIFE-only flag with one explicit switch. `gpu` is the public name for the VapourSynth/RIFE GPU path (RIFE is an implementation detail); `cpu` adds GPU-free interpolation through ffmpeg's `minterpolate` filter (motion-compensated, re-encoded with `libopenh264`). `?interpolation=off` (or omitting it) is the default copy remux. **`?interpolation=rife` and `?rife=1` still work as deprecated aliases for `gpu`.**
+- **`?fps=<n>`** chooses the interpolation target rate, 1–240, including fractional rates such as `59.94`. Default remains 40; `INTERPOLATION_FPS` overrides the default for every request (`RIFE_FPS` is still honoured).
+- **`?workers=<n>`** for CPU mode (1–32): `minterpolate` is effectively single-threaded, so the default downloads the source once and splits it into time chunks that run in parallel, then concatenates them and takes audio from the complete source. The default is all but one core, capped at 8; `?workers=1` keeps the old live single-process stream. Chunk size is tunable with `CPU_MIN_CHUNK_SECONDS`.
+- `CPU_INTERPOLATION_FILTER`, `CPU_INTERPOLATION_DISABLED`, `CPU_INTERPOLATION_DIR` and `CPU_MAX_BYTES` for tuning/disabling CPU mode; `{fps}` in the filter is replaced with the requested rate.
+- `GET /health` now reports `interpolationBusy` (the active mode or `null`) alongside the existing `rifeBusy` field.
+
+### Changed
+- Unknown `?interpolation=` values and invalid `?fps=`/`?workers=` values now return `400` with usage instead of silently playing normal mode.
+- Both interpolation modes share the one-job-at-a-time gate; normal playback is still unaffected.
+- `rife-worker.py` accepts decimal target rates and passes an exact rational (`fps_num`/`fps_den`) to RIFE.
+
+### Tests
+- 44 total; added interpolation mode/FPS/worker parsing, CPU chunk planning, default-rate env coverage, and decimal CPU filter coverage.
+
+## [1.0.16] - 2026-10-25
+
+### Fixed
+- **VLC (and other players) would not report the RIFE frame rate.** The live output is fragmented MP4, so `moov` carries no duration, and `libopenh264` wrote no H.264 VUI timing (`timing_info_present_flag=0`); VLC therefore had nothing to display and kept showing the previous/source rate (25 fps). The RIFE encoder now passes `h264_metadata=tick_rate=<2×fps>`, which writes `time_scale=80, num_units_in_tick=1` for 40 fps. VLC's Codec Information now reports **40 fps** for the stream, matching `ffprobe`/`mediainfo` (2401 frames / 60.046 s).
+- `fixed_frame_rate_flag` is deliberately not set: OpenH264's SPS has `low_delay_hrd_flag=1`, which ffmpeg's `h264_metadata` rejects when that flag is forced.
+
+### Tests
+- 38 total; added `rifeVuiTickRate` coverage.
+
+## [1.0.15] - 2026-10-25
+
+### Added
+- **`?preview=<seconds>`** caps the output (and, for RIFE, the download) at N seconds, max 600. RIFE normally downloads the entire title before producing a frame, which makes a quick visual check impractical; this lets you A/B the first minute in VLC. Works with and without `?rife=1`. Invalid/zero values mean no limit.
+
+### Tests
+- 37 total; added preview parsing/clamping coverage.
+
+## [1.0.14] - 2026-10-25
+
+### Changed
+- **Loudness normalization is now enabled by default** (1.0.13 shipped it opt-in). Every request targets `-16 LUFS`/`-1.5 dBTP`, including RIFE output. `?norm=0` opts out per request; `AUDIO_NORMALIZE=0` opts out for all requests. `AUDIO_NORM_FILTER` still overrides the target.
+
+### Tests
+- 36 total; added a child-process check that `AUDIO_NORMALIZE=0` disables the default.
+
+## [1.0.13] - 2026-10-25
+
+### Added
+- **Optional audio loudness normalization.** Source levels vary widely (measured `-28.9 LUFS` for Breaking Bad on `tik`, `-22.0 LUFS` for the same episode on `dcloud`, `-15.6 LUFS` for Fight Club), and the API previously left them untouched. `?norm=1` now applies single-pass EBU R128 `loudnorm` (`-16 LUFS`, `-1.5 dBTP`, `LRA=11`) to both remux and RIFE output; `?norm=0` forces it off. Set `AUDIO_NORMALIZE=1` to enable it by default, or override the filter with `AUDIO_NORM_FILTER`. Opt-in rather than default so already-hot sources are not attenuated unexpectedly.
+
+### Tests
+- Added tri-state coverage for `audioNormRequested` (`?norm=1`/`0`/unset); 35 total.
+
+## [1.0.12] - 2026-10-25
+
+### Fixed
+- **`tik` VidZee server**: Two independent faults made it look dead. (1) `tik` playlists point at TikTok CDN hosts (`p16-sg.tiktokcdn.com`), which some LAN resolvers answer `NXDOMAIN` for even though they resolve publicly; Node/ffmpeg failed with `getaddrinfo ENOTFOUND` before opening a socket. Added `utils/dnsFallback.js`: system resolver first, DNS-over-HTTPS (Google, then Cloudflare) on failure, with TTL caching, wired into every axios/node-fetch outbound call. (2) `tik` segments are a 70-byte 1×1 PNG header followed by MPEG-TS — the same trick `ipcloud` uses — which the probe rejected as an image. Added `utils/segment.js` to detect and strip wrappers, and `utils/hlsRelay.js`, a token-protected loopback relay that gives ffmpeg a local playlist so it gets DoH-resolved, unwrapped segments.
+- **MP4 source probe** now reads 1 KB rather than 16 bytes so the TS sync after an image prefix can be verified; image-wrapped TS is accepted instead of skipped.
+- **Optional proxy layer** (`enableProxy`): m3u8 rewriting now proxies extensionless segment URLs (TikTok's `/obj/…/<hash>` lines previously fell through to the raw CDN and broke DNS); `#EXT-X-KEY`/`#EXT-X-MAP` members are handled; `/ts-proxy` and the segment cache strip image wrappers and serve `video/mp2t`; all upstream fetches use the DoH-capable agents.
+- **Docs**: troubleshooting entry for blocked TikTok CDN DNS.
+
+### Tests
+- Added 9 network-free tests (`test/segment.test.js`, `test/hlsRelay.test.js`) covering wrapper detection/removal and relay/proxy playlist rewriting; 34 total.
+
 ## [1.0.11] - 2026-08-06
 
 ### Fixed

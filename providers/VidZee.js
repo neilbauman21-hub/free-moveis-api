@@ -41,7 +41,7 @@ const getVidZeeStreams = async (tmdbId, mediaType, seasonNum, episodeNum) => {
 
   const streams = resolved.map((s) => {
     // VidZee no longer exposes a reliable quality label; default to 720p.
-    const quality = '720p';
+    const quality = '1080p';
     return {
       name: `VidZee ${s.sr} - ${quality} - ${s.language}`,
       title: `VidZee ${s.sr} - ${quality} - ${s.language}`,

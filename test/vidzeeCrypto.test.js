@@ -6,9 +6,28 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const { buildStreamUrl, normalizeStreams, DEFAULT_SERVERS } = require('../providers/vidzeeCrypto');
-const { isEnglishish, firstPlaylistEntry, looksLikeImage } = require('../vidzee-mp4');
+const {
+  isEnglishish,
+  firstPlaylistEntry,
+  looksLikeImage,
+  audioNormRequested,
+  AUDIO_NORMALIZE_DEFAULT,
+  previewSecondsRequested,
+  parseInterpolation,
+  interpolationFpsRequested,
+  interpolationWorkersRequested,
+  DEFAULT_INTERPOLATION_FPS,
+  INTERPOLATION_FPS_MAX,
+  CPU_WORKERS_DEFAULT,
+  CPU_WORKERS_MAX,
+  planCpuChunks,
+  cpuInterpolationFilter,
+  rifeVuiTickRate,
+} = require('../vidzee-mp4');
 
 test('buildStreamUrl builds a movie URL with plaintext mode', () => {
   assert.strictEqual(
@@ -123,4 +142,151 @@ test('isEnglishish prefers English/original, rejects other languages', () => {
   assert.strictEqual(isEnglishish('Auto'), true);
   assert.strictEqual(isEnglishish('Vietnamese'), false);
   assert.strictEqual(isEnglishish('Hindi'), false);
+});
+
+test('audioNormRequested: query overrides the env default in both directions', () => {
+  // Explicit values always win, so these hold regardless of AUDIO_NORMALIZE.
+  assert.strictEqual(audioNormRequested({ norm: '1' }), true);
+  assert.strictEqual(audioNormRequested({ norm: 'true' }), true);
+  assert.strictEqual(audioNormRequested({ norm: '0' }), false);
+  assert.strictEqual(audioNormRequested({ norm: 'false' }), false);
+  // Unset/unknown falls through to the module default (on in the test env).
+  assert.strictEqual(audioNormRequested({}), AUDIO_NORMALIZE_DEFAULT);
+  assert.strictEqual(audioNormRequested({ norm: 'yes' }), AUDIO_NORMALIZE_DEFAULT);
+  assert.strictEqual(audioNormRequested(null), AUDIO_NORMALIZE_DEFAULT);
+});
+
+test('AUDIO_NORMALIZE=0 opts out of the default', () => {
+  const out = execFileSync(
+    process.execPath,
+    ['-e', "process.stdout.write(String(require('./vidzee-mp4').AUDIO_NORMALIZE_DEFAULT))"],
+    {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, AUDIO_NORMALIZE: '0' },
+    },
+  ).toString();
+  assert.strictEqual(out, 'false');
+});
+
+test('previewSecondsRequested caps and validates the preview window', () => {
+  assert.strictEqual(previewSecondsRequested({ preview: '60' }), 60);
+  assert.strictEqual(previewSecondsRequested({ preview: '1' }), 1);
+  // Clamped to 10 minutes.
+  assert.strictEqual(previewSecondsRequested({ preview: '9999' }), 600);
+  // Floored to whole seconds.
+  assert.strictEqual(previewSecondsRequested({ preview: '60.9' }), 60);
+  // Absent/invalid means no limit (not zero, which would mean "no output").
+  assert.strictEqual(previewSecondsRequested({}), null);
+  assert.strictEqual(previewSecondsRequested(null), null);
+  assert.strictEqual(previewSecondsRequested({ preview: '' }), null);
+  assert.strictEqual(previewSecondsRequested({ preview: 'abc' }), null);
+  assert.strictEqual(previewSecondsRequested({ preview: '0' }), null);
+  assert.strictEqual(previewSecondsRequested({ preview: '-5' }), null);
+});
+
+test('parseInterpolation handles explicit modes, aliases and legacy ?rife=1', () => {
+  assert.deepStrictEqual(parseInterpolation({}), { mode: null, legacy: false });
+  assert.deepStrictEqual(parseInterpolation(null), { mode: null, legacy: false });
+  // GPU is the public mode name; RIFE is an implementation detail.
+  assert.deepStrictEqual(parseInterpolation({ interpolation: 'gpu' }), { mode: 'gpu', legacy: false });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: 'GPU' }), { mode: 'gpu', legacy: false });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: 'rife' }), { mode: 'gpu', legacy: true });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: 'cpu' }), { mode: 'cpu', legacy: false });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: ' CPU ' }), { mode: 'cpu', legacy: false });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: 'off' }), { mode: null, legacy: false });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: 'none' }), { mode: null, legacy: false });
+  assert.deepStrictEqual(parseInterpolation({ interpolation: '0' }), { mode: null, legacy: false });
+  // Backwards compatibility: ?rife=1 behaves like ?interpolation=gpu.
+  assert.deepStrictEqual(parseInterpolation({ rife: '1' }), { mode: 'gpu', legacy: true });
+  // An explicit mode wins over the legacy flag (including an explicit "off").
+  assert.deepStrictEqual(
+    parseInterpolation({ rife: '1', interpolation: 'cpu' }),
+    { mode: 'cpu', legacy: false },
+  );
+  assert.deepStrictEqual(
+    parseInterpolation({ rife: '1', interpolation: 'off' }),
+    { mode: null, legacy: false },
+  );
+  // Unknown values are reported rather than silently ignored.
+  assert.deepStrictEqual(
+    parseInterpolation({ interpolation: 'gpuu' }),
+    { mode: null, legacy: false, invalid: 'gpuu' },
+  );
+});
+
+test('interpolationFpsRequested validates ?fps= and applies the default', () => {
+  assert.strictEqual(interpolationFpsRequested({}).fps, DEFAULT_INTERPOLATION_FPS);
+  assert.strictEqual(interpolationFpsRequested({}, 48).fps, 48);
+  assert.strictEqual(interpolationFpsRequested({ fps: '60' }).fps, 60);
+  assert.strictEqual(interpolationFpsRequested({ fps: ' 60 ' }).fps, 60);
+  assert.strictEqual(interpolationFpsRequested({ fps: '59.94' }).fps, 59.94);
+  assert.strictEqual(interpolationFpsRequested({ fps: '60.1234' }).fps, 60.123);
+  assert.strictEqual(interpolationFpsRequested({ fps: String(INTERPOLATION_FPS_MAX) }).fps, 240);
+  // Invalid values are reported instead of silently using the default.
+  for (const fps of ['0', '-1', '241', 'abc', 'NaN', 'Infinity']) {
+    assert.deepStrictEqual(interpolationFpsRequested({ fps }), { fps: null, invalid: fps });
+  }
+});
+
+test('interpolationWorkersRequested validates the CPU worker count', () => {
+  assert.strictEqual(interpolationWorkersRequested({}).workers, CPU_WORKERS_DEFAULT);
+  assert.strictEqual(interpolationWorkersRequested({}, 4).workers, 4);
+  assert.strictEqual(interpolationWorkersRequested({ workers: '1' }).workers, 1);
+  assert.strictEqual(interpolationWorkersRequested({ workers: '8' }).workers, 8);
+  assert.strictEqual(
+    interpolationWorkersRequested({ workers: String(CPU_WORKERS_MAX) }).workers,
+    CPU_WORKERS_MAX,
+  );
+  for (const workers of ['0', '-1', '1.5', 'abc', String(CPU_WORKERS_MAX + 1)]) {
+    assert.deepStrictEqual(
+      interpolationWorkersRequested({ workers }),
+      { workers: null, invalid: workers },
+    );
+  }
+});
+
+test('planCpuChunks splits duration into seekable, ordered ranges', () => {
+  const chunks = planCpuChunks(100, 4);
+  assert.strictEqual(chunks.length, 4);
+  assert.deepStrictEqual(chunks.map((c) => c.start), [0, 25, 50, 75]);
+  assert.deepStrictEqual(chunks.map((c) => c.duration), [25, 25, 25, 25]);
+  // The last chunk absorbs floating-point remainder and never exceeds duration.
+  const odd = planCpuChunks(10, 3);
+  assert.strictEqual(odd.length, 2); // min chunk length is 5 seconds
+  assert.strictEqual(odd[0].start, 0);
+  assert.strictEqual(odd[1].start, 5);
+  assert.strictEqual(odd[1].duration, 5);
+});
+
+test('INTERPOLATION_FPS sets the default target rate', () => {
+  const out = execFileSync(
+    process.execPath,
+    ['-e', "process.stdout.write(String(require('./vidzee-mp4').DEFAULT_INTERPOLATION_FPS))"],
+    {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, INTERPOLATION_FPS: '48', RIFE_FPS: '' },
+    },
+  ).toString();
+  assert.strictEqual(out, '48');
+});
+
+test('cpuInterpolationFilter substitutes the target fps', () => {
+  assert.match(cpuInterpolationFilter(40), /^minterpolate=fps=40:/);
+  assert.match(cpuInterpolationFilter(30), /fps=30/);
+  assert.match(cpuInterpolationFilter(59.94), /fps=59\.94/);
+  // Same sanitising as the VUI tick rate: never emit fps=0.
+  assert.match(cpuInterpolationFilter(0), /fps=1/);
+  assert.match(cpuInterpolationFilter(undefined), /fps=1/);
+});
+
+test('rifeVuiTickRate doubles the progressive frame rate for H.264 VUI', () => {
+  // time_scale/num_units_in_tick is per-field, so a 40 fps stream needs 80.
+  assert.strictEqual(rifeVuiTickRate(40), 80);
+  assert.strictEqual(rifeVuiTickRate(30), 60);
+  assert.strictEqual(rifeVuiTickRate(25), 50);
+  // Fractional target rates keep their precision in the rational VUI value.
+  assert.strictEqual(rifeVuiTickRate(59.94), 119.88);
+  // Never emit a zero tick rate (VLC would then ignore the timing info).
+  assert.strictEqual(rifeVuiTickRate(0), 2);
+  assert.strictEqual(rifeVuiTickRate(undefined), 2);
 });

@@ -5,6 +5,9 @@
 const cors = require('cors');
 const fetch = require('node-fetch');
 
+const { agentFor } = require('../utils/dnsFallback');
+const { unwrapImageTs, isMpegTs } = require('../utils/segment');
+
 const CACHE_MAX_SIZE = 2000;
 const CACHE_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
 const segmentCache = new Map();
@@ -64,9 +67,11 @@ async function prefetchSegment(url, headers) {
     const existing = segmentCache.get(url);
     if (existing && Date.now() - existing.timestamp <= CACHE_EXPIRY_MS) return;
     try {
-        const resp = await fetch(url, { headers: { 'User-Agent': DEFAULT_UA, ...headers } });
+        const resp = await fetch(url, { headers: { 'User-Agent': DEFAULT_UA, ...headers }, agent: agentFor(url) });
         if (!resp.ok) return;
-        const data = new Uint8Array(await resp.arrayBuffer());
+        // Store the unwrapped bytes: ipcloud/tik prepend a 1x1 image to every
+        // TS segment and a cached copy must not put it back.
+        const data = new Uint8Array(unwrapImageTs(Buffer.from(await resp.arrayBuffer())));
         const responseHeaders = {};
         resp.headers.forEach((v, k) => responseHeaders[k] = v);
         segmentCache.set(url, { data, headers: responseHeaders, timestamp: Date.now() });
@@ -115,34 +120,35 @@ function extractOriginalUrl(proxyUrl) {
 function rewriteM3u8(content, targetUrl, baseProxyUrl, headers) {
     const lines = content.split('\n');
     const out = []; const segmentUrls = [];
+    // A line after #EXT-X-STREAM-INF is a variant playlist even when its URL
+    // has no extension; everything else that is not a playlist is a segment.
+    let nextIsPlaylist = false;
+    const headersParam = encodeURIComponent(JSON.stringify(headers));
     for (const line of lines) {
-        if (line.startsWith('#')) {
-            if (line.startsWith('#EXT-X-KEY:')) {
-                const regex = /https?:\/\/[^""\s]+/g; const keyUrl = regex.exec(line)?.[0];
-                if (keyUrl) {
-                    const proxyUrl = `${baseProxyUrl}/ts-proxy?url=${encodeURIComponent(keyUrl)}&headers=${encodeURIComponent(JSON.stringify(headers))}`;
-                    out.push(line.replace(keyUrl, proxyUrl));
-                    if (!isCacheDisabled()) prefetchSegment(keyUrl, headers);
-                } else out.push(line);
-            } else if (line.startsWith('#EXT-X-MEDIA:') || line.startsWith('#EXT-X-I-FRAME-STREAM-INF:')) {
-                const uriMatch = line.match(/URI="([^"]+)"/);
-                if (uriMatch) {
-                    try {
-                        const mediaUrl = new URL(uriMatch[1], targetUrl).href;
-                        const proxyUrl = `${baseProxyUrl}/m3u8-proxy?url=${encodeURIComponent(mediaUrl)}&headers=${encodeURIComponent(JSON.stringify(headers))}`;
-                        out.push(line.replace(uriMatch[1], proxyUrl));
-                    } catch { out.push(line); }
-                } else out.push(line);
+        const trimmed = line.trim();
+        if (!trimmed) { out.push(line); continue; }
+        if (trimmed.startsWith('#')) {
+            if (trimmed.startsWith('#EXT-X-STREAM-INF')) nextIsPlaylist = true;
+            const uriMatch = trimmed.match(/URI="([^"]+)"/);
+            if (uriMatch && /^#EXT-X-(MEDIA|I-FRAME-STREAM-INF|KEY|MAP):/.test(trimmed)) {
+                try {
+                    const mediaUrl = new URL(uriMatch[1], targetUrl).href;
+                    const isPlaylist = /^#EXT-X-(MEDIA|I-FRAME-STREAM-INF):/.test(trimmed);
+                    const route = isPlaylist ? 'm3u8-proxy' : 'ts-proxy';
+                    out.push(line.replace(uriMatch[1], `${baseProxyUrl}/${route}?url=${encodeURIComponent(mediaUrl)}&headers=${headersParam}`));
+                    if (!isPlaylist && !isCacheDisabled()) prefetchSegment(mediaUrl, headers);
+                } catch { out.push(line); }
             } else out.push(line);
-        } else if (line.trim()) {
+        } else if (trimmed) {
             try {
-                const abs = new URL(line, targetUrl).href;
-                if (/\.m3u8(\?|$)/i.test(abs)) {
-                    out.push(`${baseProxyUrl}/m3u8-proxy?url=${encodeURIComponent(abs)}&headers=${encodeURIComponent(JSON.stringify(headers))}`);
-                } else if (/\.ts(\?|$)/i.test(abs)) {
+                const abs = new URL(trimmed, targetUrl).href;
+                if (nextIsPlaylist || /\.m3u8(\?|$)/i.test(abs)) {
+                    out.push(`${baseProxyUrl}/m3u8-proxy?url=${encodeURIComponent(abs)}&headers=${headersParam}`);
+                } else {
                     segmentUrls.push(abs);
-                    out.push(`${baseProxyUrl}/ts-proxy?url=${encodeURIComponent(abs)}&headers=${encodeURIComponent(JSON.stringify(headers))}`);
-                } else out.push(line);
+                    out.push(`${baseProxyUrl}/ts-proxy?url=${encodeURIComponent(abs)}&headers=${headersParam}`);
+                }
+                nextIsPlaylist = false;
             } catch { out.push(line); }
         } else out.push(line);
     }
@@ -161,7 +167,7 @@ function createProxyRoutes(app) {
             // Ignore URL parsing errors
         }
         try {
-            const response = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers } });
+            const response = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers }, agent: agentFor(targetUrl) });
             if (!response.ok) return res.status(response.status).json({ error: `M3U8 fetch failed: ${response.status}` });
             const text = await response.text();
             const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -239,13 +245,14 @@ function createProxyRoutes(app) {
         if (!isCacheDisabled()) {
             const cached = getCachedSegment(targetUrl);
             if (cached) {
-                const ct = inferContentType(cached.headers['content-type'], targetUrl);
+                const cachedBody = Buffer.from(cached.data);
+                const ct = isMpegTs(cachedBody) ? 'video/mp2t' : inferContentType(cached.headers['content-type'], targetUrl);
                 res.setHeader('Content-Type', ct);
                 res.setHeader('Cache-Control', 'public, max-age=3600');
                 res.setHeader('Access-Control-Allow-Origin', '*');
                 res.setHeader('Accept-Ranges', 'bytes');
                 if (debug) console.log('[ts-proxy] cache hit');
-                return res.send(Buffer.from(cached.data));
+                return res.send(cachedBody);
             }
         }
         try {
@@ -280,7 +287,7 @@ function createProxyRoutes(app) {
             let upstreamAcceptRanges = null;
             if (!effectiveRange) {
                 try {
-                    const headResp = await fetch(targetUrl, { method: 'HEAD', headers: { 'User-Agent': DEFAULT_UA, ...headers } });
+                    const headResp = await fetch(targetUrl, { method: 'HEAD', headers: { 'User-Agent': DEFAULT_UA, ...headers }, agent: agentFor(targetUrl) });
                     if (headResp.ok) {
                         contentLength = headResp.headers.get('content-length');
                         upstreamAcceptRanges = headResp.headers.get('accept-ranges');
@@ -296,7 +303,7 @@ function createProxyRoutes(app) {
                 try {
                     const probeRange = 'bytes=0-0';
                     if (debug) console.log('[ts-proxy] probe range');
-                    const probeResp = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers, 'Range': probeRange } });
+                    const probeResp = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers, 'Range': probeRange }, agent: agentFor(targetUrl) });
                     if (probeResp.status === 206) {
                         const cr = probeResp.headers.get('content-range');
                         if (cr) {
@@ -323,7 +330,7 @@ function createProxyRoutes(app) {
                     (async () => {
                         try {
                             if (debug) console.log('[ts-proxy] tail prefetch start', { tailRange });
-                            const tr = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers, Range: tailRange } });
+                            const tr = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers, Range: tailRange }, agent: agentFor(targetUrl) });
                             if (tr.status === 206) {
                                 const buf = Buffer.from(await tr.arrayBuffer());
                                 const cr = tr.headers.get('content-range');
@@ -351,7 +358,7 @@ function createProxyRoutes(app) {
                 const desired = initChunkKB * 1024;
                 const chunkSize = Math.min(desired, Math.max(0, total - 1));
                 const syntheticRange = `bytes=0-${chunkSize}`;
-                const resp = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers, 'Range': syntheticRange } });
+                const resp = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers, 'Range': syntheticRange }, agent: agentFor(targetUrl) });
                 if (resp.status === 206) {
                     if (debug) console.log('[ts-proxy] synthetic 206', syntheticRange);
                     const upstreamCT = inferContentType(resp.headers.get('content-type'), targetUrl);
@@ -372,7 +379,7 @@ function createProxyRoutes(app) {
             const upstreamOptions = { headers: { 'User-Agent': DEFAULT_UA, ...headers } };
             // If client supplied a suffix range like bytes=0- we pass it; force200 strips Range
             if (force200 && headers.Range) delete headers.Range;
-            const resp = await fetch(targetUrl, upstreamOptions);
+            const resp = await fetch(targetUrl, { ...upstreamOptions, agent: agentFor(targetUrl) });
             if (!resp.ok && resp.status !== 206) {
                 if (debug) console.log('[ts-proxy] upstream error', resp.status);
                 return res.status(resp.status).json({ error: `TS fetch failed: ${resp.status}` });
@@ -385,7 +392,6 @@ function createProxyRoutes(app) {
             }
             // Copy key streaming headers
             const upstreamCT = inferContentType(resp.headers.get('content-type'), targetUrl);
-            res.setHeader('Content-Type', upstreamCT);
             let cl = resp.headers.get('content-length');
             const crHeader = resp.headers.get('content-range');
             if (!cl && crHeader) {
@@ -396,6 +402,35 @@ function createProxyRoutes(app) {
                     if (!isNaN(start) && !isNaN(end)) cl = (end - start + 1).toString();
                 }
             }
+
+            // HLS segments are small, so buffer them and strip any image wrapper
+            // (ipcloud/tik prepend a 1x1 PNG to every TS segment). Whole-file
+            // sources (mp4/mkv) keep streaming straight through.
+            const isSegment = !/\.(mp4|mkv|zip)(\?|$)/i.test(targetUrl);
+            if (isSegment) {
+                const raw = Buffer.from(await resp.arrayBuffer());
+                const body = unwrapImageTs(raw);
+                const wrapped = body !== raw;
+                if (wrapped) {
+                    // We now have the complete clean body; upstream range offsets
+                    // referred to the wrapped bytes and no longer apply.
+                    res.status(200);
+                    res.removeHeader('Content-Range');
+                    res.setHeader('Content-Type', 'video/mp2t');
+                    res.setHeader('Content-Length', String(body.length));
+                } else {
+                    res.setHeader('Content-Type', isMpegTs(body) ? 'video/mp2t' : upstreamCT);
+                    res.setHeader('Content-Length', String(body.length));
+                    if (crHeader && !force200) res.setHeader('Content-Range', crHeader);
+                }
+                res.setHeader('Accept-Ranges', resp.headers.get('accept-ranges') || 'bytes');
+                res.setHeader('Cache-Control', 'public, max-age=3600');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                if (debug) console.log('[ts-proxy] segment body', { status: res.statusCode, wrapped, bytes: body.length });
+                return res.end(body);
+            }
+
+            res.setHeader('Content-Type', upstreamCT);
             if (cl) res.setHeader('Content-Length', cl);
             const acceptRanges = resp.headers.get('accept-ranges');
             if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges); else res.setHeader('Accept-Ranges', 'bytes');
@@ -414,7 +449,7 @@ function createProxyRoutes(app) {
             // Ignore URL parsing errors
         }
         try {
-            const resp = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers } });
+            const resp = await fetch(targetUrl, { headers: { 'User-Agent': DEFAULT_UA, ...headers }, agent: agentFor(targetUrl) });
             if (!resp.ok) return res.status(resp.status).json({ error: `subtitle fetch failed: ${resp.status}` });
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('Cache-Control', 'public, max-age=3600');
@@ -448,4 +483,4 @@ function processStreamsForProxy(streams, serverUrl) {
     });
 }
 
-module.exports = { createProxyRoutes, processStreamsForProxy };
+module.exports = { createProxyRoutes, processStreamsForProxy, rewriteM3u8 };
